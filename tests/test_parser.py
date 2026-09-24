@@ -43,3 +43,17 @@ def test_csv_quoted_and_xlsx_formula(tmp_path):
     path = tmp_path / "data.xlsx"
     book.save(path)
     assert list(rows(path, "xlsx"))[1] == ["one", "=1+1"]
+
+
+def test_malformed_multiline_csv_is_not_silently_accepted(tmp_path):
+    from importdock.parser import SeekableCSV
+
+    path = tmp_path / "broken.csv"
+    path.write_text('id,amount\n"незакрытое поле,1\n')
+    stream = SeekableCSV(path)
+    try:
+        assert next(stream) == ["id", "amount"]
+        with pytest.raises(ValueError, match="Повреждён CSV"):
+            next(stream)
+    finally:
+        stream.close()

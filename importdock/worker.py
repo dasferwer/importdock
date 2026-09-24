@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import tempfile
@@ -8,7 +9,7 @@ from pathlib import Path
 import pika
 
 from importdock.db import connect, init
-from importdock.parser import columns, rows, validate
+from importdock.parser import SeekableCSV, columns, rows, validate
 from importdock.storage import download
 
 logger = logging.getLogger(__name__)
@@ -16,13 +17,23 @@ CHUNK = 1000
 
 
 def process(conn, job, path, after_chunk=None):
-    stream = rows(path, job["format"])
+    stream = SeekableCSV(path) if job["format"] == "csv" else rows(path, job["format"])
+    try:
+        _process(conn, job, stream, after_chunk)
+    finally:
+        stream.close()
+
+
+def _process(conn, job, stream, after_chunk):
     header = next(stream, [])
     indices = columns(header, job["mapping"])
     checkpoint = job["checkpoint"]
-    # CSV и XLSX перечитываются до контрольной точки, но повторно не записываются.
-    for _ in islice(stream, checkpoint):
-        pass
+    if job["format"] == "csv" and job.get("byte_offset"):
+        stream.seek(job["byte_offset"])
+    else:
+        # Старые контрольные точки и XLSX остаются совместимы с последовательным чтением.
+        for _ in islice(stream, checkpoint):
+            pass
     while batch := list(islice(stream, CHUNK)):
         with conn.transaction():
             state = conn.execute(
@@ -59,8 +70,14 @@ def process(conn, job, path, after_chunk=None):
             checkpoint += len(batch)
             conn.execute(
                 """UPDATE jobs SET checkpoint=%s,accepted=accepted+%s,
-                rejected=rejected+%s,status='running',error=NULL WHERE id=%s""",
-                (checkpoint, accepted, rejected, job["id"]),
+                rejected=rejected+%s,byte_offset=%s,status='running',error=NULL WHERE id=%s""",
+                (
+                    checkpoint,
+                    accepted,
+                    rejected,
+                    stream.offset if job["format"] == "csv" else 0,
+                    job["id"],
+                ),
             )
         if after_chunk:
             after_chunk(checkpoint)
@@ -88,6 +105,13 @@ def tick():
                 with tempfile.TemporaryDirectory() as folder:
                     path = Path(folder) / "input"
                     download(job["object_key"], path)
+                    if job.get("source_sha"):
+                        with path.open("rb") as source:
+                            digest = hashlib.file_digest(source, "sha256").hexdigest()
+                        if digest != job["source_sha"]:
+                            raise ValueError(
+                                "Содержимое объекта изменилось: контрольная сумма не совпала"
+                            )
                     process(conn, job, path)
                 return True
             except ValueError as exc:

@@ -80,3 +80,100 @@ def test_preview_and_validation(client):
         == 422
     )
     assert client.get("/health", headers={"X-API-Key": "bad"}).status_code == 401
+
+
+def test_csv_resume_uses_byte_boundary_with_multiline_unicode(client, tmp_path, monkeypatch):
+    import csv
+
+    from importdock.parser import SeekableCSV
+
+    path = tmp_path / "multi.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["id", "amount"])
+        for i in range(2005):
+            writer.writerow([f"Запись {i}\nвторая строка", "1.25"])
+    task = job()
+
+    def stop(_):
+        raise InterruptedError()
+
+    with connect() as conn:
+        conn.autocommit = True
+        with pytest.raises(InterruptedError):
+            process(conn, task, path, stop)
+        task = conn.execute("SELECT * FROM jobs WHERE id=%s", (task["id"],)).fetchone()
+    assert task["byte_offset"] > 0
+    count = 0
+    original = SeekableCSV.__next__
+
+    def counted(self):
+        nonlocal count
+        count += 1
+        return original(self)
+
+    monkeypatch.setattr(SeekableCSV, "__next__", counted)
+    with connect() as conn:
+        conn.autocommit = True
+        process(conn, task, path)
+    # Заголовок + остаток + проверки EOF; первые 1000 записей повторно не разбираются.
+    assert count <= 1010
+    result = client.get(f"/imports/{task['id']}").json()
+    assert result["accepted"] == 2005
+    assert result["rejected"] == 0
+
+
+def test_cancel_resume_preserves_checkpoint_and_rollback_forbids_resume(client, tmp_path):
+    path = tmp_path / "input.csv"
+    path.write_text("id,amount\n" + "".join(f"{i},1\n" for i in range(1500)))
+    task = job()
+
+    def stop(_):
+        client.post(f"/imports/{task['id']}/cancel")
+
+    with connect() as conn:
+        conn.autocommit = True
+        process(conn, task, path, stop)
+    resumed = client.post(f"/imports/{task['id']}/resume").json()
+    assert resumed["checkpoint"] == 1000
+    with connect() as conn:
+        conn.autocommit = True
+        current = conn.execute("SELECT * FROM jobs WHERE id=%s", (task["id"],)).fetchone()
+        process(conn, current, path)
+    assert client.get(f"/imports/{task['id']}").json()["accepted"] == 1500
+    assert client.post(f"/imports/{task['id']}/rollback").status_code == 200
+    assert client.post(f"/imports/{task['id']}/resume").status_code == 409
+
+
+def test_upload_intent_exists_before_storage_and_retry_recovers(client, monkeypatch):
+    import pika
+
+    from importdock import api
+
+    def fail(path, key):
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id=%s", (key,)).fetchone()
+            assert row["status"] == "uploading"
+            assert row["source_sha"]
+        raise OSError("Хранилище недоступно")
+
+    monkeypatch.setattr(api, "upload", fail)
+    payload = {
+        "files": {"file": ("test.csv", b"id,amount\na,1\n")},
+        "data": {"mapping": '{"external_id":"id","amount":"amount"}'},
+    }
+    assert client.post("/imports", **payload).status_code == 503
+    with connect() as conn:
+        assert conn.execute("SELECT status FROM jobs").fetchone()["status"] == "upload_failed"
+    monkeypatch.setattr(api, "upload", lambda path, key: None)
+    monkeypatch.setenv("AMQP_URL", "amqp://demo:demo@localhost:1/%2F")
+
+    def unavailable(*args, **kwargs):
+        raise pika.exceptions.AMQPConnectionError()
+
+    monkeypatch.setattr(api.pika, "BlockingConnection", unavailable)
+    result = client.post("/imports", **payload)
+    assert result.status_code == 200
+    assert result.json()["status"] == "queued"
+    with connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"] == 1

@@ -24,4 +24,6 @@ def init():
             CREATE TABLE IF NOT EXISTS errors (
                 job_id uuid NOT NULL REFERENCES jobs(id), row_number bigint NOT NULL,
                 message text NOT NULL, PRIMARY KEY(job_id,row_number));
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS byte_offset bigint NOT NULL DEFAULT 0;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_sha text;
         """)

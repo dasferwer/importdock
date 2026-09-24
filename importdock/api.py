@@ -96,19 +96,31 @@ def create(
         fingerprint = digest.hexdigest() + format + json.dumps(fields, sort_keys=True)
         identity = uuid.uuid5(uuid.NAMESPACE_URL, fingerprint)
         with connect() as conn:
-            existing = conn.execute("SELECT * FROM jobs WHERE id=%s", (identity,)).fetchone()
-        if existing:
-            return existing
-        try:
-            upload(path, str(identity))
-        except Exception as exc:
-            raise HTTPException(503, "Хранилище временно недоступно") from exc
-        with connect() as conn:
-            conn.execute(
-                """INSERT INTO jobs (id,object_key,format,mapping) VALUES (%s,%s,%s,%s)
-                         ON CONFLICT DO NOTHING""",
-                (identity, str(identity), format, Jsonb(fields)),
-            )
+            conn.autocommit = True
+            lock = identity.int % (2**63 - 1)
+            conn.execute("SELECT pg_advisory_lock(%s)", (lock,))
+            try:
+                existing = conn.execute("SELECT * FROM jobs WHERE id=%s", (identity,)).fetchone()
+                if existing and existing["status"] not in ("uploading", "upload_failed"):
+                    return existing
+                # Объект получает запись-владельца до обращения к S3. Сбой не оставляет бесхозный ключ.
+                conn.execute(
+                    "INSERT INTO jobs(id,object_key,format,mapping,status,source_sha) VALUES (%s,%s,%s,%s,'uploading',%s) ON CONFLICT(id) DO UPDATE SET status='uploading',error=NULL",
+                    (identity, str(identity), format, Jsonb(fields), digest.hexdigest()),
+                )
+                try:
+                    upload(path, str(identity))
+                except Exception as exc:
+                    conn.execute(
+                        "UPDATE jobs SET status='upload_failed',error='Загрузка объекта не завершена' WHERE id=%s",
+                        (identity,),
+                    )
+                    raise HTTPException(
+                        503, "Хранилище временно недоступно; повторите загрузку"
+                    ) from exc
+                conn.execute("UPDATE jobs SET status='queued',error=NULL WHERE id=%s", (identity,))
+            finally:
+                conn.execute("SELECT pg_advisory_unlock(%s)", (lock,))
         try:
             broker = pika.BlockingConnection(pika.URLParameters(os.environ["AMQP_URL"]))
             try:
@@ -176,8 +188,22 @@ def rollback(identity: uuid.UUID):
         job = conn.execute("SELECT * FROM jobs WHERE id=%s FOR UPDATE", (identity,)).fetchone()
         if not job:
             raise HTTPException(404, "Импорт не найден")
-        if job["status"] in {"queued", "running"}:
+        if job["status"] in {"queued", "running", "uploading"}:
             raise HTTPException(409, "Сначала отмените импорт")
         conn.execute("DELETE FROM records WHERE job_id=%s", (identity,))
         conn.execute("UPDATE jobs SET status='rolled_back' WHERE id=%s", (identity,))
     return get_job(identity)
+
+
+@app.post("/imports/{identity}/resume")
+def resume(identity: uuid.UUID):
+    with connect() as conn:
+        row = conn.execute(
+            "UPDATE jobs SET status='queued',error=NULL WHERE id=%s AND status IN ('cancelled','failed') RETURNING *",
+            (identity,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            409, "Возобновление разрешено только для отменённого или неудачного импорта без отката"
+        )
+    return row
