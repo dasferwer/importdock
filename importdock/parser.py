@@ -6,8 +6,8 @@ from openpyxl import load_workbook
 
 def rows(path, format):
     if format == "csv":
-        with open(path, encoding="utf-8-sig", newline="") as stream:
-            yield from csv.reader(stream)
+        with SeekableCSV(path) as stream:
+            yield from stream
     else:
         workbook = load_workbook(path, read_only=True, data_only=False)
         try:
@@ -70,10 +70,20 @@ class SeekableCSV:
     """Позиция снимается после логической записи, включая поля с переводами строк."""
 
     def __init__(self, path, offset=0):
-        self.stream = open(path, "rb")  # noqa: SIM115 — process закрывает поток в finally.
-        self.stream.seek(offset)
-        self.lines = PhysicalLines(self.stream)
-        self.reader = csv.reader(self.lines, strict=True)
+        self.stream = open(path, "rb")  # noqa: SIM115 — владелец закрывает поток через close.
+        try:
+            self.stream.seek(offset)
+            self.lines = PhysicalLines(self.stream)
+            self.reader = csv.reader(self.lines, strict=True)
+        except BaseException:
+            self.stream.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     def __iter__(self):
         return self

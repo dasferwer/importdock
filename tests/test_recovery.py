@@ -82,6 +82,18 @@ def test_preview_and_validation(client):
     assert client.get("/health", headers={"X-API-Key": "bad"}).status_code == 401
 
 
+@pytest.mark.parametrize("preview", ["true", "false"])
+def test_malformed_csv_is_rejected_before_job_creation(client, preview):
+    response = client.post(
+        "/imports",
+        files={"file": ("input.csv", b'id,amount\n"unclosed,1\n')},
+        data={"mapping": '{"external_id":"id","amount":"amount"}', "preview": preview},
+    )
+    assert response.status_code == 422
+    with connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
 def test_csv_resume_uses_byte_boundary_with_multiline_unicode(client, tmp_path, monkeypatch):
     import csv
 
