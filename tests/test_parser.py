@@ -133,3 +133,89 @@ def test_seekable_csv_offset_follows_bom_multiline_crlf_record(tmp_path):
         assert list(stream) == [["東京", "2.50"]]
     finally:
         stream.close()
+
+
+@pytest.mark.parametrize("amount", ["1e1000000", "-1e1000000", "1e-1000000", "sNaN"])
+def test_extreme_decimal_is_row_error(amount):
+    with pytest.raises(ValueError):
+        validate(["id", amount], {"external_id": 0, "amount": 1})
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("9999999999999999.99", "9999999999999999.99"),
+        ("-9999999999999999.99", "-9999999999999999.99"),
+        ("1.230000", "1.23"),
+        ("0e1000000", "0.00"),
+        ("0e-1000000", "0.00"),
+    ],
+)
+def test_money_has_exact_representable_scale_independent_of_context(raw, expected):
+    from decimal import getcontext, localcontext
+
+    with localcontext() as context:
+        context.prec = 6
+        before = context.copy()
+        identity, value = validate(["id", raw], {"external_id": 0, "amount": 1})
+        assert identity == "id" and value == Decimal(expected)
+        assert value.as_tuple().exponent == -2
+        assert getcontext().prec == before.prec
+        assert getcontext().flags == before.flags
+        assert getcontext().traps == before.traps
+
+
+@pytest.mark.parametrize("mode", ["eof", "early-close", "read-error", "open-error"])
+def test_extensionless_xlsx_closes_binary_stream(tmp_path, monkeypatch, mode):
+    import builtins
+    from zipfile import BadZipFile
+
+    from importdock import parser
+
+    path = tmp_path / "input"
+    book = Workbook()
+    book.active.append(["id", "amount"])
+    book.active.append(["a", "1.25"])
+    book.save(path)
+    book.close()
+    if mode == "open-error":
+        path.write_bytes(b"broken ZIP")
+    opened = []
+    workbooks = []
+    original = parser.load_workbook
+
+    def track_open(*args, **kwargs):
+        stream = builtins.open(*args, **kwargs)  # noqa: SIM115 — владелец парсер.
+        opened.append(stream)
+        return stream
+
+    def track_workbook(*args, **kwargs):
+        workbook = original(*args, **kwargs)
+        workbooks.append(workbook)
+        if mode == "read-error":
+
+            def broken(*args, **kwargs):
+                yield ("id", "amount")
+                raise ValueError("Ошибка чтения записи")
+
+            monkeypatch.setattr(workbook.active, "iter_rows", broken)
+        return workbook
+
+    monkeypatch.setattr(parser, "open", track_open, raising=False)
+    monkeypatch.setattr(parser, "load_workbook", track_workbook)
+    iterator = rows(path, "xlsx")
+    if mode == "open-error":
+        with pytest.raises(BadZipFile):
+            next(iterator)
+    else:
+        assert next(iterator) == ["id", "amount"]
+        assert len(opened) == 1 and not opened[0].closed
+        if mode == "read-error":
+            with pytest.raises(ValueError, match="Ошибка чтения записи"):
+                list(iterator)
+        elif mode == "eof":
+            assert list(iterator) == [["a", "1.25"]]
+        else:
+            iterator.close()
+    assert len(opened) == 1 and opened[0].closed
+    assert all(book._archive.fp is None for book in workbooks)

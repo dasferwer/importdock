@@ -1,5 +1,5 @@
 import csv
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, DecimalException, InvalidOperation
 
 from openpyxl import load_workbook
 
@@ -9,12 +9,13 @@ def rows(path, format):
         with SeekableCSV(path) as stream:
             yield from stream
     else:
-        workbook = load_workbook(path, read_only=True, data_only=False)
-        try:
-            for row in workbook.active.iter_rows(values_only=True):
-                yield ["" if value is None else str(value) for value in row]
-        finally:
-            workbook.close()
+        with open(path, "rb") as source:
+            workbook = load_workbook(source, read_only=True, data_only=False)
+            try:
+                for row in workbook.active.iter_rows(values_only=True):
+                    yield ["" if value is None else str(value) for value in row]
+            finally:
+                workbook.close()
 
 
 def columns(header, mapping):
@@ -39,13 +40,15 @@ def validate(row, indices):
         raise ValueError("Нет поля или сумма не является числом") from exc
     if not identity or len(identity) > 120 or "\x00" in identity:
         raise ValueError("Идентификатор должен содержать от 1 до 120 символов")
-    if (
-        not amount.is_finite()
-        or abs(amount) >= Decimal("1e16")
-        or amount != amount.quantize(Decimal("0.01"))
-    ):
+    if not amount.is_finite() or amount.copy_abs() >= Decimal("1e16"):
         raise ValueError("Нужна конечная сумма с точностью не более двух знаков")
-    return identity, amount
+    try:
+        money = amount.quantize(Decimal("0.01"), context=Context(prec=18))
+    except DecimalException as exc:
+        raise ValueError("Нужна конечная сумма с точностью не более двух знаков") from exc
+    if amount != money:
+        raise ValueError("Нужна конечная сумма с точностью не более двух знаков")
+    return identity, money
 
 
 class PhysicalLines:

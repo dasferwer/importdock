@@ -40,5 +40,10 @@ jobs:
             sleep 2
           done
           uv run python -m scripts.recovery
+      - name: XLSX и ошибки сумм после предпросмотра
+        env:
+          DATABASE_URL: postgresql://demo:demo@localhost:54830/importdock
+          API_KEY: local-demo-key
+        run: uv run python -m scripts.format_smoke
       - if: always()
         run: docker compose down

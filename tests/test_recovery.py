@@ -189,3 +189,172 @@ def test_upload_intent_exists_before_storage_and_retry_recovers(client, monkeypa
     assert result.json()["status"] == "queued"
     with connect() as conn:
         assert conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"] == 1
+
+
+def xlsx_bytes(count):
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active.append(["id", "amount"])
+    for i in range(count):
+        book.active.append([f"item-{i:04d}", "1.25"])
+    target = BytesIO()
+    book.save(target)
+    book.close()
+    return target.getvalue()
+
+
+def test_xlsx_preview_and_resume_extensionless_input(client, tmp_path):
+    payload = xlsx_bytes(2005)
+    response = client.post(
+        "/imports",
+        files={"file": ("real.xlsx", payload)},
+        data={"mapping": '{"external_id":"id","amount":"amount"}', "preview": "true"},
+    )
+    assert response.status_code == 200
+    assert response.json()["checked"] == 20
+    assert all(row["amount"] == "1.25" for row in response.json()["preview"])
+    path = tmp_path / "input"
+    path.write_bytes(payload)
+    task = job("xlsx")
+
+    def stop(_):
+        raise InterruptedError("Остановка после committed chunk")
+
+    with connect() as conn:
+        conn.autocommit = True
+        with pytest.raises(InterruptedError):
+            process(conn, task, path, stop)
+        task = conn.execute("SELECT * FROM jobs WHERE id=%s", (task["id"],)).fetchone()
+        assert task["checkpoint"] == task["accepted"] == 1000
+        assert task["byte_offset"] == 0
+        process(conn, task, path)
+    result = client.get(f"/imports/{task['id']}").json()
+    assert (result["status"], result["checkpoint"], result["accepted"], result["rejected"]) == (
+        "completed",
+        2005,
+        2005,
+        0,
+    )
+    with connect() as conn:
+        saved = conn.execute(
+            "SELECT count(*) AS n, min(amount) AS lo, max(amount) AS hi FROM records WHERE job_id=%s",
+            (task["id"],),
+        ).fetchone()
+    assert saved["n"] == 2005 and saved["lo"] == saved["hi"] == 1.25
+
+
+def test_extreme_amount_after_preview_is_terminal_row_error_and_queue_continues(
+    client, monkeypatch
+):
+    import pika
+
+    from importdock import api, worker
+
+    objects = {}
+    monkeypatch.setattr(api, "upload", lambda path, key: objects.update({key: path.read_bytes()}))
+    monkeypatch.setattr(worker, "download", lambda key, path: path.write_bytes(objects[key]))
+    monkeypatch.setenv("AMQP_URL", "amqp://demo:demo@localhost:1/%2F")
+
+    def unavailable(*args, **kwargs):
+        raise pika.exceptions.AMQPConnectionError()
+
+    monkeypatch.setattr(api.pika, "BlockingConnection", unavailable)
+    payload = b"id,amount\n" + b"".join(f"item-{i},1.25\n".encode() for i in range(20))
+    payload += b"poison,1e1000000\nzero,0e1000000\nnext,2.50\n"
+    task = client.post(
+        "/imports",
+        files={"file": ("poison.csv", payload)},
+        data={"mapping": '{"external_id":"id","amount":"amount"}'},
+    )
+    assert task.status_code == 200
+    identity = task.json()["id"]
+    assert worker.tick()
+    result = client.get(f"/imports/{identity}").json()
+    assert (result["status"], result["checkpoint"], result["accepted"], result["rejected"]) == (
+        "completed",
+        23,
+        22,
+        1,
+    )
+    assert result["byte_offset"] == len(payload)
+    assert client.get(f"/imports/{identity}/errors").json()[0]["row_number"] == 21
+    assert not worker.tick()
+    next_task = client.post(
+        "/imports",
+        files={"file": ("next.csv", b"id,amount\nhealthy,3.50\n")},
+        data={"mapping": '{"external_id":"id","amount":"amount"}'},
+    ).json()
+    assert worker.tick()
+    assert client.get(f"/imports/{next_task['id']}").json()["status"] == "completed"
+
+
+def test_database_error_still_retries_job(client, tmp_path, monkeypatch):
+    import psycopg
+
+    from importdock import worker
+
+    task = job()
+    monkeypatch.setattr(worker, "download", lambda key, path: path.write_bytes(b"id,amount\na,1\n"))
+    original = worker.process
+
+    def outage(*args, **kwargs):
+        raise psycopg.OperationalError("Временный сбой БД")
+
+    monkeypatch.setattr(worker, "process", outage)
+    assert not worker.tick()
+    assert client.get(f"/imports/{task['id']}").json()["status"] == "queued"
+    monkeypatch.setattr(worker, "process", original)
+    assert worker.tick()
+    assert client.get(f"/imports/{task['id']}").json()["status"] == "completed"
+
+
+def test_corrupt_xlsx_is_rejected_before_job_creation(client):
+    response = client.post(
+        "/imports",
+        files={"file": ("broken.xlsx", b"not a zip")},
+        data={"mapping": '{"external_id":"id","amount":"amount"}'},
+    )
+    assert response.status_code == 422
+    with connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
+def test_xlsx_formula_is_preview_row_error(client):
+    from io import BytesIO
+
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active.append(["id", "amount"])
+    book.active.append(["formula", "=1+1"])
+    source = BytesIO()
+    book.save(source)
+    book.close()
+    response = client.post(
+        "/imports",
+        files={"file": ("formula.xlsx", source.getvalue())},
+        data={"mapping": '{"external_id":"id","amount":"amount"}', "preview": "true"},
+    )
+    assert response.status_code == 200
+    assert "error" in response.json()["preview"][0]
+
+
+def test_xlsx_expanded_size_guard_rejects_archive_before_job(client):
+    import struct
+
+    payload = bytearray(xlsx_bytes(1))
+    central_header = payload.index(b"PK\x01\x02")
+    # Настоящий ZIP с метаданными большого элемента, без выделения 513 МиБ в тесте.
+    struct.pack_into("<I", payload, central_header + 24, 513 * 1024 * 1024)
+    response = client.post(
+        "/imports",
+        files={"file": ("oversized.xlsx", bytes(payload))},
+        data={"mapping": '{"external_id":"id","amount":"amount"}'},
+    )
+    assert response.status_code == 422
+    assert "512 МиБ" in response.json()["detail"]
+    with connect() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"] == 0
