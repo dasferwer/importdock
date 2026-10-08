@@ -5,11 +5,16 @@ API/worker с настоящим PostgreSQL тоже падали (XLSX → 422;
 после первых 20 строк → queued вместо завершения).
 
 Локально использованы Python 3.12.13, зафиксированные зависимости и отдельный
-PostgreSQL 17. Полный suite: **46 passed**; 32 проверки parser входят в это число.
+PostgreSQL 17. Полный suite: **48 passed**; 32 проверки parser входят в это число.
 Проверены закрытие XLSX на EOF/раннем close/read error/open error, точные границы
 numeric(18,2), неизменный Decimal context, extreme exponents, XLSX resume с
 checkpoint 1000 → 2005, CSV byte checkpoint, продолжение очереди и retry при
 OperationalError. Formula/corrupt ZIP/512 МиБ archive metadata guard проверены.
+По итоговому ревью добавлены два настоящих XLSX с поздним повреждением CRC/XML:
+preview20 успешен, worker сохраняет checkpoint3000/4000, затем job становится
+failed и следующий исправный job завершается. Обе регрессии сначала дали RED;
+узкий перевод BadZipFile/ParseError в ValueError дал GREEN. Ошибки OSError и БД
+не перехватываются этим обработчиком.
 Ruff, форматирование и Compose config проходят.
 
 Отдельно собран штатный Python 3.11 runtime и запущены API, PostgreSQL, MinIO,

@@ -1,5 +1,7 @@
 import csv
 from decimal import Context, Decimal, DecimalException, InvalidOperation
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
 
 from openpyxl import load_workbook
 
@@ -9,13 +11,16 @@ def rows(path, format):
         with SeekableCSV(path) as stream:
             yield from stream
     else:
-        with open(path, "rb") as source:
-            workbook = load_workbook(source, read_only=True, data_only=False)
-            try:
-                for row in workbook.active.iter_rows(values_only=True):
-                    yield ["" if value is None else str(value) for value in row]
-            finally:
-                workbook.close()
+        try:
+            with open(path, "rb") as source:
+                workbook = load_workbook(source, read_only=True, data_only=False)
+                try:
+                    for row in workbook.active.iter_rows(values_only=True):
+                        yield ["" if value is None else str(value) for value in row]
+                finally:
+                    workbook.close()
+        except (BadZipFile, ParseError) as exc:
+            raise ValueError("Повреждён XLSX: " + str(exc)) from exc
 
 
 def columns(header, mapping):

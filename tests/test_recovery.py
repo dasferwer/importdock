@@ -358,3 +358,80 @@ def test_xlsx_expanded_size_guard_rejects_archive_before_job(client):
     assert "512 МиБ" in response.json()["detail"]
     with connect() as conn:
         assert conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"] == 0
+
+
+def late_damaged_xlsx(damage):
+    import struct
+    from io import BytesIO
+    from zipfile import ZIP_DEFLATED, ZipFile
+
+    payload = xlsx_bytes(4000)
+    sheet = "xl/worksheets/sheet1.xml"
+    if damage == "xml":
+        output = BytesIO()
+        with ZipFile(BytesIO(payload)) as source, ZipFile(output, "w", ZIP_DEFLATED) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == sheet:
+                    data = data.replace(b"</sheetData>", b"</invalidTag>")
+                target.writestr(info, data)
+        return output.getvalue()
+    broken = bytearray(payload)
+    offset = broken.index(b"PK\x01\x02")
+    while broken[offset : offset + 4] == b"PK\x01\x02":
+        name_size, extra_size, comment_size = struct.unpack_from("<HHH", broken, offset + 28)
+        name = bytes(broken[offset + 46 : offset + 46 + name_size]).decode()
+        if name == sheet:
+            crc = struct.unpack_from("<I", broken, offset + 16)[0]
+            struct.pack_into("<I", broken, offset + 16, crc ^ 1)
+            return bytes(broken)
+        offset += 46 + name_size + extra_size + comment_size
+    raise AssertionError("В настоящем workbook не найден worksheet")
+
+
+@pytest.mark.parametrize("damage,checkpoint", [("crc", 3000), ("xml", 4000)])
+def test_late_xlsx_damage_fails_after_committed_chunks_and_queue_continues(
+    client, monkeypatch, damage, checkpoint
+):
+    import pika
+
+    from importdock import api, worker
+
+    objects = {}
+    monkeypatch.setattr(api, "upload", lambda path, key: objects.update({key: path.read_bytes()}))
+    monkeypatch.setattr(worker, "download", lambda key, path: path.write_bytes(objects[key]))
+    monkeypatch.setenv("AMQP_URL", "amqp://demo:demo@localhost:1/%2F")
+
+    def unavailable(*args, **kwargs):
+        raise pika.exceptions.AMQPConnectionError()
+
+    monkeypatch.setattr(api.pika, "BlockingConnection", unavailable)
+    payload = late_damaged_xlsx(damage)
+    data = {"mapping": '{"external_id":"id","amount":"amount"}'}
+    preview = client.post(
+        "/imports", files={"file": ("late.xlsx", payload)}, data={**data, "preview": "true"}
+    )
+    assert preview.status_code == 200 and preview.json()["checked"] == 20
+    created = client.post("/imports", files={"file": ("late.xlsx", payload)}, data=data)
+    assert created.status_code == 200
+    identity = created.json()["id"]
+    assert not worker.tick()
+    result = client.get(f"/imports/{identity}").json()
+    assert result["status"] == "failed"
+    assert "Повреждён XLSX" in result["error"]
+    assert result["checkpoint"] == result["accepted"] == checkpoint
+    assert result["rejected"] == result["byte_offset"] == 0
+    assert client.get(f"/imports/{identity}/records").status_code == 409
+    with connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) AS n FROM records WHERE job_id=%s", (identity,)
+            ).fetchone()["n"]
+            == checkpoint
+        )
+    assert not worker.tick()
+    next_job = client.post(
+        "/imports", files={"file": ("next.csv", b"id,amount\nhealthy,3.50\n")}, data=data
+    ).json()
+    assert worker.tick()
+    assert client.get(f"/imports/{next_job['id']}").json()["status"] == "completed"

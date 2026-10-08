@@ -168,7 +168,6 @@ def test_money_has_exact_representable_scale_independent_of_context(raw, expecte
 @pytest.mark.parametrize("mode", ["eof", "early-close", "read-error", "open-error"])
 def test_extensionless_xlsx_closes_binary_stream(tmp_path, monkeypatch, mode):
     import builtins
-    from zipfile import BadZipFile
 
     from importdock import parser
 
@@ -205,7 +204,7 @@ def test_extensionless_xlsx_closes_binary_stream(tmp_path, monkeypatch, mode):
     monkeypatch.setattr(parser, "load_workbook", track_workbook)
     iterator = rows(path, "xlsx")
     if mode == "open-error":
-        with pytest.raises(BadZipFile):
+        with pytest.raises(ValueError, match="Повреждён XLSX"):
             next(iterator)
     else:
         assert next(iterator) == ["id", "amount"]
